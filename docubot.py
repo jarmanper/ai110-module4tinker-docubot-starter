@@ -9,6 +9,162 @@ Core DocuBot class responsible for:
 
 import os
 import glob
+import re
+
+# Common English stopwords: improves scoring/guardrails (weak matches on "the", "what", …).
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "but",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "as",
+        "by",
+        "with",
+        "from",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "have",
+        "has",
+        "had",
+        "do",
+        "does",
+        "did",
+        "will",
+        "would",
+        "could",
+        "should",
+        "may",
+        "might",
+        "must",
+        "can",
+        "it",
+        "this",
+        "that",
+        "these",
+        "those",
+        "i",
+        "you",
+        "he",
+        "she",
+        "we",
+        "they",
+        "what",
+        "which",
+        "who",
+        "whom",
+        "when",
+        "where",
+        "why",
+        "how",
+        "if",
+        "than",
+        "so",
+        "too",
+        "very",
+        "just",
+        "not",
+        "no",
+        "any",
+        "each",
+        "few",
+        "more",
+        "most",
+        "some",
+        "such",
+        "all",
+        "both",
+        "into",
+        "through",
+        "during",
+        "before",
+        "after",
+        "above",
+        "below",
+        "between",
+        "under",
+        "there",
+        "here",
+    }
+)
+
+
+def _tokenize(text):
+    """Lowercase word tokens; strips punctuation at word boundaries."""
+    return re.findall(r"\b\w+\b", text.lower())
+
+
+def _substantive_tokens(query):
+    """
+    Query tokens used for relevance and guardrails.
+    Falls back to all tokens when the query is only stopwords.
+    """
+    raw = _tokenize(query)
+    substantive = [t for t in raw if t not in _STOPWORDS]
+    return substantive if substantive else raw
+
+
+# Tiny synonym/variant lists so obvious doc wording (e.g. "connection") still scores.
+_TOKEN_VARIANTS = {
+    "connect": ("connection", "connections", "connected", "connecting"),
+    "list": ("lists",),
+    "return": ("returns", "returned", "returning"),
+    "generated": ("generate", "generates", "generation"),
+}
+
+# Count identifiers like generate_access_token when the query uses "generated".
+_EXTRA_TOKEN_REGEX = {
+    "generated": re.compile(r"\bgenerate\w*"),
+}
+
+
+def _evidence_score_threshold(query):
+    """
+    Minimum cumulative keyword score required on the best snippet to treat
+    retrieval as grounded. Refuse when the best match is weak.
+    """
+    tokens = _substantive_tokens(query)
+    if not tokens:
+        return None
+    n = len(tokens)
+    return max(2, (n + 1) // 2)
+
+
+def _split_into_chunks(text, max_chunk_chars=1400):
+    """
+    Split one document into smaller units: blank-line-separated paragraphs.
+    Oversized blocks are sliced so no single chunk dominates retrieval.
+    """
+    parts = re.split(r"\n\s*\n", text.strip())
+    raw = [p.strip() for p in parts if p.strip()]
+    chunks = []
+    for p in raw:
+        if len(p) <= max_chunk_chars:
+            chunks.append(p)
+        else:
+            for i in range(0, len(p), max_chunk_chars):
+                chunks.append(p[i : i + max_chunk_chars])
+    merged = []
+    for c in chunks:
+        if merged and len(c) < 60:
+            merged[-1] = merged[-1] + "\n\n" + c
+        else:
+            merged.append(c)
+    return merged
+
 
 class DocuBot:
     def __init__(self, docs_folder="docs", llm_client=None):
@@ -22,8 +178,17 @@ class DocuBot:
         # Load documents into memory
         self.documents = self.load_documents()  # List of (filename, text)
 
-        # Build a retrieval index (implemented in Phase 1)
-        self.index = self.build_index(self.documents)
+        # Paragraph-level chunks for retrieval (filename, snippet text)
+        self.chunks = self._documents_to_chunks(self.documents)
+        # Inverted index: token -> sorted chunk indices
+        self.index = self.build_index(self.chunks)
+
+    def _documents_to_chunks(self, documents):
+        out = []
+        for filename, text in documents:
+            for chunk in _split_into_chunks(text):
+                out.append((filename, chunk))
+        return out
 
     # -----------------------------------------------------------
     # Document Loading
@@ -48,24 +213,19 @@ class DocuBot:
     # Index Construction (Phase 1)
     # -----------------------------------------------------------
 
-    def build_index(self, documents):
+    def build_index(self, chunks):
         """
-        TODO (Phase 1):
-        Build a tiny inverted index mapping lowercase words to the documents
-        they appear in.
+        Build an inverted index mapping lowercase words to chunk indices
+        (each chunk is one retrieval unit: a paragraph-sized snippet).
 
-        Example structure:
-        {
-            "token": ["AUTH.md", "API_REFERENCE.md"],
-            "database": ["DATABASE.md"]
-        }
-
-        Keep this simple: split on whitespace, lowercase tokens,
-        ignore punctuation if needed.
+        Example for a token appearing in chunks from two files:
+        { "token": [0, 4, 7] }
         """
-        index = {}
-        # TODO: implement simple indexing
-        return index
+        index_sets = {}
+        for i, (_, text) in enumerate(chunks):
+            for token in set(_tokenize(text)):
+                index_sets.setdefault(token, set()).add(i)
+        return {t: sorted(indices) for t, indices in index_sets.items()}
 
     # -----------------------------------------------------------
     # Scoring and Retrieval (Phase 1)
@@ -73,27 +233,66 @@ class DocuBot:
 
     def score_document(self, query, text):
         """
-        TODO (Phase 1):
-        Return a simple relevance score for how well the text matches the query.
-
-        Suggested baseline:
-        - Convert query into lowercase words
-        - Count how many appear in the text
-        - Return the count as the score
+        Relevance score: sum of whole-word hit counts for substantive query tokens.
         """
-        # TODO: implement scoring
-        return 0
+        tokens = _substantive_tokens(query)
+        if not tokens:
+            return 0
+        lowered = text.lower()
+        total = 0
+        for w in tokens:
+            n = len(re.findall(r"\b" + re.escape(w) + r"\b", lowered))
+            for v in _TOKEN_VARIANTS.get(w, ()):
+                n += len(re.findall(r"\b" + re.escape(v) + r"\b", lowered))
+            rx = _EXTRA_TOKEN_REGEX.get(w)
+            if rx is not None:
+                n += len(rx.findall(lowered))
+            total += min(n, 4)
+        return total
 
     def retrieve(self, query, top_k=3):
         """
-        TODO (Phase 1):
-        Use the index and scoring function to select top_k relevant document snippets.
+        Use the index and scoring function to select top_k relevant snippets.
 
-        Return a list of (filename, text) sorted by score descending.
+        Returns a list of (filename, snippet_text) sorted by score descending.
+        Empty list when there is insufficient evidence (guardrail).
         """
-        results = []
-        # TODO: implement retrieval logic
-        return results[:top_k]
+        threshold = _evidence_score_threshold(query)
+        if threshold is None:
+            return []
+
+        query_tokens = _tokenize(query)
+        candidates = set()
+        for t in query_tokens:
+            if t in self.index:
+                candidates.update(self.index[t])
+        if not candidates:
+            candidates = set(range(len(self.chunks)))
+
+        scored = []
+        for i in candidates:
+            filename, chunk_text = self.chunks[i]
+            score = self.score_document(query, chunk_text)
+            scored.append((score, filename, chunk_text))
+
+        scored.sort(key=lambda x: (-x[0], x[1], x[2][:80]))
+
+        if not scored or scored[0][0] < threshold:
+            return []
+
+        # One best chunk per file so top_k spans sources and stays easier to read.
+        out = []
+        used_files = set()
+        for score, filename, chunk_text in scored:
+            if score < threshold:
+                break
+            if filename in used_files:
+                continue
+            used_files.add(filename)
+            out.append((filename, chunk_text))
+            if len(out) >= top_k:
+                break
+        return out
 
     # -----------------------------------------------------------
     # Answering Modes

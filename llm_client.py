@@ -47,11 +47,19 @@ class GeminiClient:
     # -----------------------------------------------------------
 
     def naive_answer_over_full_docs(self, query, all_text):
-        # We ignore all_text and send a generic prompt instead
         prompt = f"""
-    You are a documentation assistant. 
-    Answer this developer question: {query}
-    """
+You are a documentation assistant. Your ONLY allowed facts are in the documentation below.
+
+Documentation:
+{all_text}
+
+Answer the developer question using only that documentation. If it does not contain
+enough information, reply exactly:
+"I do not know based on these docs."
+
+Developer question:
+{query}
+"""
         response = self.model.generate_content(prompt)
         return (response.text or "").strip()
 
@@ -73,7 +81,7 @@ class GeminiClient:
         """
 
         if not snippets:
-            return "I do not know based on the docs I have."
+            return "I do not know based on these docs."
 
         context_blocks = []
         for filename, text in snippets:
@@ -103,7 +111,7 @@ Rules:
 - Use only the information in the snippets. Do not invent new functions,
   endpoints, or configuration values.
 - If the snippets are not enough to answer confidently, reply exactly:
-  "I do not know based on the docs I have."
+  "I do not know based on these docs."
 - When you do answer, briefly mention which files you relied on.
 """
 
